@@ -98,13 +98,18 @@ def post_correction_reply(tweet_id, correction_message):
 
 
 def is_valid_candidate(tweet, already_corrected_ids):
-    """Validates a tweet candidate based on required fields, correction status, and age."""
+    """Validates a tweet candidate based on required fields, correction status, age, and skip status."""
     tweet_id = tweet.get("tweet_id")
     timestamp_str = tweet.get("timestamp")
     engagement = tweet.get("engagement", {})
-    mistake_info = tweet.get("mistake_found") #renamed to mistake
+    mistake_info = tweet.get("mistake_found")
+    skipped = tweet.get("skipped", False)  # Default to False if not present
 
-    if not (tweet_id and timestamp_str and engagement and mistake_info and isinstance(engagement, dict) and isinstance(mistake_info, dict)): #renamed to mistake
+    if skipped: #NEW
+        log.debug(f"Skipping candidate {tweet_id}: Marked as skipped.") #NEW
+        return False #NEW
+
+    if not (tweet_id and timestamp_str and engagement and mistake_info and isinstance(engagement, dict) and isinstance(mistake_info, dict)):
         log.debug(f"Skipping candidate {tweet_id or 'Unknown'}: Missing required fields.")
         return False
 
@@ -131,7 +136,7 @@ def is_valid_candidate(tweet, already_corrected_ids):
 
         tweet["parsed_timestamp"] = tweet_time
     except (ValueError, TypeError) as e:
-        log.warning(f"Skipping candidate {tweet_id}: Could not parse timestamp '{timestamp_str}'. Mistake: {e}") #renamed to mistake
+        log.warning(f"Skipping candidate {tweet_id}: Could not parse timestamp '{timestamp_str}'. Mistake: {e}")
         return False
 
     if (datetime.now(timezone.utc) - tweet_time).days > 2:
@@ -189,9 +194,9 @@ def process_tweets():
 
     if best_tweet:
         tweet_id = best_tweet["tweet_id"]
-        incorrect = best_tweet["mistake_found"]["incorrect"] #renamed to mistake
-        correct = best_tweet["mistake_found"]["correct"] #renamed to mistake
-        log.info(f"Attempting correction for tweet: ID {tweet_id}, Mistake: '{incorrect}' -> '{correct}'") #renamed to mistake
+        incorrect = best_tweet["mistake_found"]["incorrect"]
+        correct = best_tweet["mistake_found"]["correct"]
+        log.info(f"Attempting correction for tweet: ID {tweet_id}, Mistake: '{incorrect}' -> '{correct}'")
 
         correction_message = f"تصحيح:\n❌ {incorrect}\n✅ {correct}"
         log.debug(f"Correction message: \"{correction_message.replace('\n', ' ')}\"")
@@ -204,6 +209,17 @@ def process_tweets():
                 log.info(f"Processed, posted reply, and logged tweet {tweet_id}.")
         else:
             log.warning(f"Did not post correction for tweet {tweet_id} (failed or forbidden).")
+            # --- MARK AS SKIPPED ---
+            for tweet in candidate_tweets: # Find the tweet in the list
+               if tweet["tweet_id"] == tweet_id:
+                  tweet["skipped"] = True
+                  break # Exit the loop after marking it
+
+            if not save_json_file(tweets_to_correct_file, candidate_tweets): # Save updated list
+               log.error(f"CRITICAL: Failed to save updated tweets to {tweets_to_correct_file}! This tweet might be retried indefinitely.")
+            # --- ---
+
+
     else:
         log.info("No suitable tweet selected.")
 
