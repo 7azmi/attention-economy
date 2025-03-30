@@ -1,2 +1,5 @@
 tweepy
 dotenv
+bs4
+playwright
+urllib3
