@@ -7,8 +7,12 @@ import re # Import regex module
 # Define error pairs (incorrect, correct)
 # You can easily add more pairs here
 ERROR_PAIRS = [
-    # ("انشاء الله", "إن شاء الله"),
+    ("انشاء الله", "إن شاء الله"),
     ("لاكن", "لكن"),
+    ("ضلم", "ظلم"),
+    ("ضالم", "ظالم"),
+    ("خطاء", "خطأ"),
+
     # Add more pairs as needed, e.g., ("مثلا", "مثلاً")
 ]
 
