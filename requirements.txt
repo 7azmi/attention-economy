@@ -4,3 +4,4 @@ bs4
 playwright
 urllib3
 google-genai
+python-dateutil

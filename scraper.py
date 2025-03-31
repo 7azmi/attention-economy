@@ -1,3 +1,4 @@
+# scraper.py
 import asyncio
 import json
 import re
@@ -15,6 +16,7 @@ ERROR_PAIRS = [
     ("ضلم", "ظلم"),
     ("ضالم", "ظالم"),
     ("خطاء", "خطأ"),
+    ("هاذا", "هذا"),
 ]
 
 

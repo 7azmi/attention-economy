@@ -100,20 +100,27 @@ def post_correction_reply(tweet_id, correction_message):
 def is_valid_candidate(tweet, already_corrected_ids):
     """Validates a tweet candidate based on required fields, correction status, age, and skip status."""
     tweet_id = tweet.get("tweet_id")
-    timestamp_str = tweet.get("timestamp")
-    engagement = tweet.get("engagement", {})
-    mistake_info = tweet.get("mistake_found")
     skipped = tweet.get("skipped", False)  # Default to False if not present
 
-    if skipped: #NEW
-        log.debug(f"Skipping candidate {tweet_id}: Marked as skipped.") #NEW
-        return False #NEW
-
-    if not (tweet_id and timestamp_str and engagement and mistake_info and isinstance(engagement, dict) and isinstance(mistake_info, dict)):
-        log.debug(f"Skipping candidate {tweet_id or 'Unknown'}: Missing required fields.")
+    if skipped: # Skip before any other checks
+        log.debug(f"Skipping candidate {tweet_id}: Marked as skipped.")
         return False
 
-    if tweet_id in already_corrected_ids:
+    if tweet_id in already_corrected_ids: # Check if already corrected before doing any further parsing
+        log.debug(f"Skipping candidate {tweet_id}: Already corrected.") # add logging
+        return False
+
+    timestamp_str = tweet.get("timestamp")
+    engagement = tweet.get("engagement", {})
+    # --- CHANGE HERE ---
+    error_info = tweet.get("error_found") # Changed from mistake_found
+    # --- ---
+
+    # --- CHANGE HERE ---
+    # Check if error_info exists and is a dictionary
+    if not (tweet_id and timestamp_str and engagement and error_info and isinstance(engagement, dict) and isinstance(error_info, dict)):
+    # --- ---
+        log.debug(f"Skipping candidate {tweet_id or 'Unknown'}: Missing required fields (tweet_id, timestamp, engagement, error_found).")
         return False
 
     try:
@@ -157,7 +164,8 @@ def select_best_candidate(candidate_tweets, already_corrected_ids):
         engagement = tweet.get("engagement", {})
         tweet["engagement_score"] = engagement.get("retweets", 0) * 1.5 + engagement.get("likes", 0)  # Add engagement score
 
-    best_tweet = max(valid_candidates, key=lambda t: t["parsed_timestamp"], default=None)  # Sort by most recent
+    # Select the MOST RECENT valid tweet
+    best_tweet = max(valid_candidates, key=lambda t: t["parsed_timestamp"], default=None)
 
     if best_tweet:
         log.info(
@@ -165,6 +173,8 @@ def select_best_candidate(candidate_tweets, already_corrected_ids):
         )
         return best_tweet
     else:
+        # This case should technically not be reached if valid_candidates is not empty,
+        # but kept for safety.
         return None
 
 
@@ -194,8 +204,10 @@ def process_tweets():
 
     if best_tweet:
         tweet_id = best_tweet["tweet_id"]
-        incorrect = best_tweet["mistake_found"]["incorrect"]
-        correct = best_tweet["mistake_found"]["correct"]
+        # --- CHANGE HERE ---
+        incorrect = best_tweet["error_found"]["incorrect"] # Changed from mistake_found
+        correct = best_tweet["error_found"]["correct"]   # Changed from mistake_found
+        # --- ---
         log.info(f"Attempting correction for tweet: ID {tweet_id}, Mistake: '{incorrect}' -> '{correct}'")
 
         correction_message = f"تصحيح:\n❌ {incorrect}\n✅ {correct}"
@@ -213,6 +225,7 @@ def process_tweets():
             for tweet in candidate_tweets: # Find the tweet in the list
                if tweet["tweet_id"] == tweet_id:
                   tweet["skipped"] = True
+                  log.info(f"Marking tweet {tweet_id} as skipped in candidate list.") # Add log
                   break # Exit the loop after marking it
 
             if not save_json_file(tweets_to_correct_file, candidate_tweets): # Save updated list
