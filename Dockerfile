@@ -10,9 +10,6 @@ COPY requirements.txt .
 # Install the project dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers
-RUN pip install playwright && playwright install firefox
-
 # Copy the rest of the project files into the container
 COPY . .
 
