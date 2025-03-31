@@ -204,10 +204,8 @@ def process_tweets():
 
     if best_tweet:
         tweet_id = best_tweet["tweet_id"]
-        # --- CHANGE HERE ---
-        incorrect = best_tweet["error_found"]["incorrect"] # Changed from mistake_found
-        correct = best_tweet["error_found"]["correct"]   # Changed from mistake_found
-        # --- ---
+        incorrect = best_tweet["error_found"]["incorrect"]
+        correct = best_tweet["error_found"]["correct"]
         log.info(f"Attempting correction for tweet: ID {tweet_id}, Mistake: '{incorrect}' -> '{correct}'")
 
         correction_message = f"تصحيح:\n❌ {incorrect}\n✅ {correct}"
@@ -222,16 +220,20 @@ def process_tweets():
         else:
             log.warning(f"Did not post correction for tweet {tweet_id} (failed or forbidden).")
             # --- MARK AS SKIPPED ---
-            for tweet in candidate_tweets: # Find the tweet in the list
-               if tweet["tweet_id"] == tweet_id:
-                  tweet["skipped"] = True
-                  log.info(f"Marking tweet {tweet_id} as skipped in candidate list.") # Add log
-                  break # Exit the loop after marking it
+            for tweet in candidate_tweets:
+                if tweet["tweet_id"] == tweet_id:
+                    tweet["skipped"] = True
+                    log.info(f"Marking tweet {tweet_id} as skipped in candidate list.")
+                    break
 
-            if not save_json_file(tweets_to_correct_file, candidate_tweets): # Save updated list
-               log.error(f"CRITICAL: Failed to save updated tweets to {tweets_to_correct_file}! This tweet might be retried indefinitely.")
+            # Convert datetime to string before saving
+            for tweet in candidate_tweets:
+                if "parsed_timestamp" in tweet and isinstance(tweet["parsed_timestamp"], datetime):
+                    tweet["parsed_timestamp"] = tweet["parsed_timestamp"].isoformat()
+
+            if not save_json_file(tweets_to_correct_file, candidate_tweets):
+                log.error(f"CRITICAL: Failed to save updated tweets to {tweets_to_correct_file}! This tweet might be retried indefinitely.")
             # --- ---
-
 
     else:
         log.info("No suitable tweet selected.")
