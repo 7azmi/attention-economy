@@ -10,7 +10,9 @@ COPY requirements.txt .
 # Install the project dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the project files into the container
+RUN pip install playwright
+
+RUN playwright install --with-deps firefox # Copy the rest of the project files into the container
 COPY . .
 
 # Set the command to run when the container starts
