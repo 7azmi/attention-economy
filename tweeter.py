@@ -178,6 +178,7 @@ def select_best_candidate(candidate_tweets, already_corrected_ids):
         return None
 
 
+
 def process_tweets():
     """Main function to load tweets, select the best candidate, and post a correction."""
     today_str = date.today().strftime("%Y-%m-%d")
