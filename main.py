@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 
 # --- Configuration Constants ---
 # Define core operational parameters clearly
-DAILY_CORRECTION_LIMIT = 10     # Target number of corrections per day
+DAILY_CORRECTION_LIMIT = 15    # Target number of corrections per day
 SCRAPER_TIMEOUT_S = 120       # Max time for scraper script (seconds)
 TWEETER_TIMEOUT_S = 60        # Max time for tweeter script (seconds)
 MAX_INTERVAL_JITTER_S = 300   # Max random variation +/- for cycle interval (seconds)
