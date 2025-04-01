@@ -48,7 +48,7 @@ CREDENTIALS = {
 # --- End Credential Loading ---
 
 # Operational Parameters (Can be shared or customized via .env if needed)
-DAILY_CORRECTION_LIMIT = int(os.getenv(f"DAILY_LIMIT_{BOT_ID.upper()}", 15)) # Allow override per bot
+DAILY_CORRECTION_LIMIT = int(os.getenv(f"DAILY_LIMIT_{BOT_ID.upper()}", 45)) # Allow override per bot
 SCRAPER_TIMEOUT_S = 120
 TWEETER_TIMEOUT_S = 60
 MAX_INTERVAL_JITTER_S = 300
@@ -85,22 +85,19 @@ ERROR_PAIRS_ENGLISH = [
     ("إنفايت", "دعوة"),
     ("انڤايت", "دعوة"),
     ("إنڤايت", "دعوة"),
-    ("إيڤينت", "حدث"), # Note: Removed backtick from original example `إيڤينت
+    ("إيڤينت", "حدث"),
     ("ايڤينت", "حدث"),
     ("اڤينت", "حدث"),
-    # ("اڤينت", "حدث"), # Duplicate
     ("ايڤنت", "حدث"),
     ("ايفنت", "حدث"),
     ("إيفنت", "حدث"),
     ("إيفينت", "حدث"),
     ("إفينت", "حدث"),
     ("افينت", "حدث"),
-    # ("افينت", "حدث"), # Duplicate
     ("لينك", "رابط"),    # Added examples
-    ("اونلاين", "متصل بالانترنت"), # Added examples
-    ("اون لاين", "متصل بالانترنت"), # Added examples
     ("بروجكت", "مشروع"),   # Added examples
     ("داتا", "بيانات"),     # Added examples
+    ("الداتا", "البيانات"),  # Added examples
 ]
 
 ERROR_PAIRS = ERROR_PAIRS_GRAMMAR if BOT_ID == 'grammar' else ERROR_PAIRS_ENGLISH
@@ -482,7 +479,7 @@ def process_and_correct_tweet(candidate_tweets, already_corrected_ids): # ... (s
             processed_ids_set.add(tweet_id)
 
         # Construct message (uses username from candidate)
-        correction_message = f"@{candidate['username']} تصحيح:\n❌ {incorrect}\n✅ {correct}"
+        correction_message = f"❌ {incorrect}\n✅ {correct}"
         log.debug(f"Correction message: \"{correction_message.replace(chr(10), ' ')}\"")
 
         success, error_type = _post_correction_reply_internal(tweet_id, correction_message)
