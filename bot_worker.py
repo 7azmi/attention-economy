@@ -677,7 +677,7 @@ def process_and_correct_tweet(candidate_tweets, bot_state: BotState, tweepy_clie
 
         # --- Step 2: Construct the reply message ---
         # Consider adding context or being gentler? Optional.
-        correction_message = f"@{username}\n\nتصويب:\n❌ {incorrect}\n✅ {correct}"
+        correction_message = f"❌ {incorrect}\n✅ {correct}"
         log.debug(f"Correction message prepared for {tweet_id}: \"{correction_message.replace(chr(10), ' ')}\"")
 
         # --- Step 3: Attempt to post the reply ---
