@@ -1,4 +1,3 @@
-version: "3.9"
 services:
   app:
     build: .  # Build from the Dockerfile in the current directory
