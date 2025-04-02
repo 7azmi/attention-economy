@@ -48,7 +48,7 @@ CREDENTIALS = {
 # --- End Credential Loading ---
 
 # Operational Parameters
-DAILY_CORRECTION_LIMIT = int(os.getenv(f"DAILY_LIMIT_{BOT_ID.upper()}", 30))
+DAILY_CORRECTION_LIMIT = int(os.getenv(f"DAILY_LIMIT_{BOT_ID.upper()}", 15))
 SCRAPER_TIMEOUT_S = 120
 TWEETER_TIMEOUT_S = 60
 MAX_INTERVAL_JITTER_S = 300
@@ -212,7 +212,7 @@ def get_corrections_made_today():
     """Gets the list of corrected tweet IDs from today's log file (specific to this bot instance)."""
     # (No changes needed here, already uses BOT_ID)
     today_str = date.today().strftime("%Y-%m-%d")
-    corrections_file = f"corrections_{BOT_ID}_{today_str}.json"
+    corrections_file = f"{PERSISTENT_QUEUE_DIR}/corrections_{BOT_ID}_{today_str}.json"
     corrections_list = load_json_file(corrections_file, default=[]) # Use our robust loader
 
     if isinstance(corrections_list, list):

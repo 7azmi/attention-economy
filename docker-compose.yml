@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  app:
+    build: .  # Build from the Dockerfile in the current directory
+    volumes:
+      - app_data:/app/temp_data # Mount the named volume
+    restart: always # Restart policy to keep the container running
+    # Optional: If you need to expose ports to the host
+    # ports:
+    #   - "8000:8000" # Example: Map host port 8000 to container port 8000
+volumes:
+  app_data: # Define the named volume
