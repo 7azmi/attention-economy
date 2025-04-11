@@ -9,12 +9,14 @@ import time
 import random
 import argparse
 import shutil # For safe file saving
+import math # For score calculation (exp)
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path # Using pathlib for easier path handling
+from typing import List, Dict, Tuple, Optional, Set
 
 # --- Third-Party Libraries ---
 import tweepy
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Page, Browser, PlaywrightContextManager
 from dotenv import load_dotenv
 
 # --- Argument Parsing ---
@@ -28,14 +30,37 @@ BOT_ID = args.bot_id
 # --- Configuration Loading ---
 load_dotenv()
 
+# --- Define Error Pairs (Moved before Config for clarity) ---
+ERROR_PAIRS_GRAMMAR: List[Tuple[str, str]] = [
+    ("انشاء الله", "إن شاء الله"), ("إنشاء الله", "إن شاء الله"), ("لاكن", "لكن"),
+    ("ضلم", "ظلم"), ("ضالم", "ظالم"), ("خطاء", "خطأ"), ("هاذا", "هذا"),
+    # Add more grammar pairs here
+]
+ERROR_PAIRS_ENGLISH: List[Tuple[str, str]] = [
+    ("ميتنج", "اجتماع"), ("ميتنغ", "اجتماع"), ("ميتنق", "اجتماع"),
+    ("انفايت", "دعوة"), ("إنفايت", "دعوة"), ("انڤايت", "دعوة"), ("إنڤايت", "دعوة"),
+    ("إيڤينت", "حدث"), ("ايڤينت", "حدث"), ("اڤينت", "حدث"), ("ايڤنت", "حدث"),
+    ("ايفنت", "حدث"), ("إيفنت", "حدث"), ("إيفينت", "حدث"), ("إفينت", "حدث"), ("افينت", "حدث"),
+    ("برفكت", "مثالي"), ("بيرفكت", "مثالي"), ("بيرفيكت", "مثالي"), ("برفيكت", "مثالي"),
+    ("بروجكت", "مشروع"), ("داتا", "بيانات"), ("الداتا", "البيانات"),
+    ("اللوقو", "الشعار"), ("اللوجو", "الشعار"), ("اللوغو", "الشعار"),
+    ("البانر", "اللافتة"),
+    ("فانزات", "معجبين | مشجعين | هواة"),
+    ("امبوستر", "مزيف | مُنتحِل | محتال | نصاب"),
+    ("الداون تاون", "وسط المدينة | منتصف المدينة"), ("داون تاون", "وسط المدينة | منتصف المدينة"),
+    ("ستيكر", "ملصق | لاصق"), ("ستكر", "ملصق | لاصق"),
+    # Add more English pairs here
+]
+# --- End Error Pairs ---
+
 class Config:
     """Holds bot configuration."""
-    def __init__(self, bot_id):
+    def __init__(self, bot_id: str):
         self.bot_id = bot_id.upper()
-        self.debug_mode = os.getenv("DEBUG_MODE", "True").lower() in ("true", "1", "t")
+        self.debug_mode = os.getenv("DEBUG_MODE", "False").lower() in ("true", "1", "t") # Default Debug to False
         self.log_level = logging.DEBUG if self.debug_mode else logging.INFO
 
-        # Credentials
+        # Credentials (ensure they exist using validate_credentials later)
         self.api_key = os.getenv(f"API_KEY_{self.bot_id}")
         self.api_secret = os.getenv(f"API_SECRET_{self.bot_id}")
         self.bearer_token = os.getenv(f"BEARER_TOKEN_{self.bot_id}")
@@ -46,78 +71,66 @@ class Config:
         self.daily_correction_limit = int(os.getenv(f"DAILY_LIMIT_{self.bot_id}", 15))
         self.min_engagement_query = os.getenv(f"MIN_ENGAGEMENT_{self.bot_id}", "(min_retweets:50 OR min_faves:100)")
         self.max_tweet_age_days = int(os.getenv("MAX_TWEET_AGE_DAYS", 2))
-        self.scrape_max_tweets = int(os.getenv("SCRAPE_MAX_TWEETS", 30))
-        self.scraper_timeout_s = int(os.getenv("SCRAPER_TIMEOUT_S", 120)) * 1000 # Playwright uses ms
-        self.tweeter_timeout_s = int(os.getenv("TWEETER_TIMEOUT_S", 60)) # Not directly used by Tweepy v2 client creation?
+        self.scrape_max_tweets_per_cycle = int(os.getenv("SCRAPE_MAX_TWEETS_PER_CYCLE", 50))
+        self.scraper_timeout_ms = int(os.getenv("SCRAPER_TIMEOUT_S", 120)) * 1000 # Playwright uses ms
         self.max_interval_jitter_s = int(os.getenv("MAX_INTERVAL_JITTER_S", 300))
         self.min_sleep_between_cycles_s = int(os.getenv("MIN_SLEEP_BETWEEN_CYCLES_S", 60))
-        self.max_processed_history_size = int(os.getenv("MAX_PROCESSED_QUEUE_SIZE", 200))
+        self.max_processed_history_size = int(os.getenv("MAX_PROCESSED_QUEUE_SIZE", 500))
 
+        # Nitter & Scraping Settings
         self.nitter_instances = [
             "https://nitter.net", "https://nitter.privacydev.net",
             "https://nitter.poast.org", "https://nitter.cz",
             # Add more reliable instances if needed
         ]
+        self.search_chunk_size = int(os.getenv("SEARCH_CHUNK_SIZE", 7))
 
-        project_root = Path(__file__).parent  # Gets the directory where bot_worker.py is
+        # *** FIX: Ensure score_age_decay_k is initialized ***
+        self.score_age_decay_k = float(os.getenv("SCORE_AGE_DECAY_K", 0.075))
+
+        # Paths
+        project_root = Path(__file__).parent
         self.state_dir = Path(os.getenv("PERSISTENT_DATA_DIR", project_root / "temp_data"))
+        self.state_filename = self.state_dir / f"bot_id_{bot_id.lower()}.json"
 
-        self.state_filename = self.state_dir / f"state_{bot_id.lower()}.json"
+        # Error Pairs (Assigned based on bot_id)
+        self.error_pairs = ERROR_PAIRS_GRAMMAR if bot_id.lower() == 'grammar' else ERROR_PAIRS_ENGLISH
 
-        # Error Pairs (Defined later based on bot_id)
-        self.error_pairs = []
-
-    def validate_credentials(self):
+    def validate_credentials(self) -> List[str]:
         """Checks if all necessary Twitter API credentials are present."""
         missing = []
-        if not self.api_key: missing.append(f"API_KEY_{self.bot_id}")
-        if not self.api_secret: missing.append(f"API_SECRET_{self.bot_id}")
-        if not self.bearer_token: missing.append(f"BEARER_TOKEN_{self.bot_id}")
-        if not self.access_token: missing.append(f"ACCESS_TOKEN_{self.bot_id}")
-        if not self.access_token_secret: missing.append(f"ACCESS_TOKEN_SECRET_{self.bot_id}")
+        creds = {
+            f"API_KEY_{self.bot_id}": self.api_key,
+            f"API_SECRET_{self.bot_id}": self.api_secret,
+            f"BEARER_TOKEN_{self.bot_id}": self.bearer_token,
+            f"ACCESS_TOKEN_{self.bot_id}": self.access_token,
+            f"ACCESS_TOKEN_SECRET_{self.bot_id}": self.access_token_secret,
+        }
+        for name, value in creds.items():
+            if not value:
+                missing.append(name)
         return missing
 
 # --- Instantiate Configuration ---
 config = Config(BOT_ID)
 
-# --- Define Error Pairs Based on BOT_ID ---
-ERROR_PAIRS_GRAMMAR = [
-    ("انشاء الله", "إن شاء الله"), ("إنشاء الله", "إن شاء الله"), ("لاكن", "لكن"),
-    ("ضلم", "ظلم"), ("ضالم", "ظالم"), ("خطاء", "خطأ"), ("هاذا", "هذا"),
-]
-ERROR_PAIRS_ENGLISH = [
-    ("ميتنج", "اجتماع"), ("ميتنغ", "اجتماع"), ("ميتنق", "اجتماع"),
-    ("انفايت", "دعوة"), ("إنفايت", "دعوة"), ("انڤايت", "دعوة"), ("إنڤايت", "دعوة"),
-    ("إيڤينت", "حدث"), ("ايڤينت", "حدث"), ("اڤينت", "حدث"), ("ايڤنت", "حدث"),
-    ("ايفنت", "حدث"), ("إيفنت", "حدث"), ("إيفينت", "حدث"), ("إفينت", "حدث"), ("افينت", "حدث"),
-    ("برفكت", "مثالي"), ("بيرفكت", "مثالي"), ("بيرفيكت", "مثالي"), ("برفيكت", "مثالي"),
-    ("بروجكت", "مشروع"), ("داتا", "بيانات"), ("الداتا", "البيانات"),
-
-    # إضافات جديدة
-    ("اللوقو", "الشعار"), ("اللوجو", "الشعار"), ("اللوغو", "الشعار"),
-    ("البانر", "اللافتة"),
-    ("فانزات", "معجبين | مشجعين | هواة"),
-    ("امبوستر", "مزيف | مُنتحِل | محتال | نصاب"),
-    ("الداون تاون", "وسط المدينة | منتصف المدينة"), ("داون تاون", "وسط المدينة | منتصف المدينة"),
-    ("ستيكر", "ملصق | لاصق"), ("ستكر", "ملصق | لاصق"),
-]
-
-
-config.error_pairs = ERROR_PAIRS_GRAMMAR if BOT_ID == 'grammar' else ERROR_PAIRS_ENGLISH
-# --- End Error Pairs ---
-
 # --- Logging Setup ---
 log_filename = f"bot_log_{BOT_ID}_{date.today().strftime('%Y-%m-%d')}.log"
+# Ensure log directory exists if state_dir is used for logs too (or define a separate log dir)
+log_dir = config.state_dir # Assuming logs go in the same persistent data dir
+log_dir.mkdir(parents=True, exist_ok=True)
+log_filepath = log_dir / log_filename
+
 logging.basicConfig(
     level=config.log_level,
     format=f'%(asctime)s - %(levelname)s - [{config.bot_id}] - %(name)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.FileHandler(log_filepath, encoding='utf-8'), # Use full path
         logging.StreamHandler()
     ]
 )
 log = logging.getLogger(f"bot_worker.{BOT_ID}")
-log.info(f"Logging initialized. Level: {logging.getLevelName(config.log_level)}")
+log.info(f"Logging initialized. Level: {logging.getLevelName(config.log_level)}. Log file: {log_filepath}")
 # --- End Logging Setup ---
 
 
@@ -138,11 +151,10 @@ class BotState:
         self.config = config
         self.filepath = config.state_filename
         self.max_history = config.max_processed_history_size
-        self._processed_ids_list = [] # Order matters for trimming
-        self._processed_ids_set = set() # Fast lookups
-        self.corrections_today_count = 0
-        self.last_reset_date = date.min # Initialize to a very old date
-
+        self._processed_ids_list: List[str] = [] # Order matters for trimming
+        self._processed_ids_set: Set[str] = set() # Fast lookups
+        self.corrections_today_count: int = 0
+        self.last_reset_date: date = date.min # Initialize to a very old date
         self.load()
 
     def _initialize_empty_state(self):
@@ -164,16 +176,14 @@ class BotState:
                 return
 
             with open(self.filepath, "r", encoding="utf-8") as f:
-                content = f.read()
+                content = f.read().strip()
                 if not content:
                     log.warning(f"State file is empty: {self.filepath}. Initializing fresh state.")
                     self._initialize_empty_state()
                     self.save()
                     return
-
                 data = json.loads(content)
 
-            # Validate loaded data
             if not isinstance(data, dict):
                  raise ValueError("State file root is not a dictionary.")
 
@@ -194,7 +204,6 @@ class BotState:
                  log.warning(f"Invalid or missing 'last_reset_date' in state file. Resetting daily count.")
                  self.last_reset_date = date.min # Force reset below
 
-            # Check if we need to reset the daily counter
             today = date.today()
             if self.last_reset_date < today:
                 log.info(f"Date changed ({self.last_reset_date} -> {today}). Resetting daily correction count.")
@@ -203,96 +212,94 @@ class BotState:
             else:
                 self.corrections_today_count = loaded_count
 
-            # Load processed IDs, ensuring they are strings
-            self._processed_ids_list = [str(id_val) for id_val in loaded_ids if id_val] # Ensure strings
+            self._processed_ids_list = [str(id_val) for id_val in loaded_ids if id_val]
             self._processed_ids_set = set(self._processed_ids_list)
-
-            # Trim if loaded list exceeds max size (shouldn't happen with proper saving, but safe)
             self._trim_history()
 
-            log.info(f"State loaded successfully. {self.corrections_today_count} corrections made today ({self.last_reset_date}). {len(self._processed_ids_set)} IDs in recent history.")
+            log.info(f"State loaded. Daily count: {self.corrections_today_count} ({self.last_reset_date}). History size: {len(self._processed_ids_set)}.")
 
         except json.JSONDecodeError:
-            log.error(f"Invalid JSON found in state file: {self.filepath}. Backing up and initializing fresh state.")
+            log.error(f"Invalid JSON in state file: {self.filepath}. Backing up and initializing fresh state.")
             self._backup_corrupt_file()
             self._initialize_empty_state()
             self.save()
         except Exception as e:
-            log.critical(f"Failed to load state file {self.filepath}: {e}. Initializing fresh state.", exc_info=self.config.debug_mode)
-            # Potentially back up file here too
+            log.critical(f"Failed to load state {self.filepath}: {e}. Initializing fresh state.", exc_info=self.config.debug_mode)
+            self._backup_corrupt_file() # Attempt backup even on generic load errors
             self._initialize_empty_state()
-            # Attempt to save the fresh state, but failure might indicate deeper issues
             self.save()
 
     def _backup_corrupt_file(self):
-        """Creates a timestamped backup of a corrupt state file."""
+        """Creates a timestamped backup of a potentially corrupt state file."""
         if self.filepath.exists():
             try:
+                # Ensure state_dir exists before creating backup path
+                self.config.state_dir.mkdir(parents=True, exist_ok=True)
                 backup_path = self.filepath.with_suffix(f".corrupt_{int(time.time())}.json")
                 shutil.move(str(self.filepath), str(backup_path))
-                log.info(f"Backed up corrupt state file to: {backup_path}")
+                log.info(f"Backed up potentially corrupt state file to: {backup_path}")
             except Exception as backup_e:
-                log.error(f"Could not back up corrupt state file {self.filepath}: {backup_e}")
+                log.error(f"Could not back up state file {self.filepath}: {backup_e}")
 
     def save(self) -> bool:
         """Saves the current state to the JSON file atomically."""
         log.debug(f"Attempting to save state to: {self.filepath}")
+        # Ensure state_dir exists before saving
+        try:
+            self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.error(f"Could not ensure state directory exists before saving: {e}. Save will likely fail.")
+            return False
+
         state_data = {
             "last_reset_date": self.last_reset_date.isoformat(),
             "corrections_today_count": self.corrections_today_count,
-            "processed_ids": self._processed_ids_list # Save the ordered list
+            "processed_ids": self._processed_ids_list
         }
         temp_filepath = self.filepath.with_suffix(".tmp")
         try:
-            # Write to temporary file first
             with open(temp_filepath, "w", encoding="utf-8") as f:
                 json.dump(state_data, f, ensure_ascii=False, indent=4)
-
-            # Atomically replace the original file
             shutil.move(str(temp_filepath), str(self.filepath))
-            log.debug(f"State saved successfully to {self.filepath}")
+            log.debug(f"State saved successfully ({len(self._processed_ids_list)} IDs).")
             return True
-        except (IOError, OSError, Exception) as e:
-            log.error(f"Failed to save state to {self.filepath}: {e}", exc_info=self.config.debug_mode)
-            # Clean up temp file if it exists
+        except Exception as e:
+            log.error(f"Failed to save state to {self.filepath}: {e}", exc_info=config.debug_mode)
             if temp_filepath.exists():
-                try:
-                    temp_filepath.unlink()
-                except OSError:
-                    pass # Ignore cleanup error
+                try: temp_filepath.unlink()
+                except OSError: pass
             return False
 
     def _trim_history(self):
         """Removes oldest entries from history if max size is exceeded."""
         removed_count = 0
         while len(self._processed_ids_list) > self.max_history:
-            removed_id = self._processed_ids_list.pop(0) # Remove from the front (oldest)
-            self._processed_ids_set.discard(removed_id) # Remove from set too
+            removed_id = self._processed_ids_list.pop(0)
+            self._processed_ids_set.discard(removed_id)
             removed_count += 1
         if removed_count > 0:
-            log.debug(f"Trimmed {removed_count} oldest IDs from processed history (new size: {len(self._processed_ids_list)}).")
+            log.debug(f"Trimmed {removed_count} oldest IDs from history (new size: {len(self._processed_ids_list)}).")
 
     def add_processed(self, tweet_id: str):
         """Marks a tweet ID as processed (attempted). Saves state."""
-        tweet_id = str(tweet_id) # Ensure string
+        tweet_id = str(tweet_id)
         if tweet_id not in self._processed_ids_set:
             log.debug(f"Adding tweet ID {tweet_id} to processed history.")
-            self._processed_ids_list.append(tweet_id) # Add to end (most recent)
+            self._processed_ids_list.append(tweet_id)
             self._processed_ids_set.add(tweet_id)
-            self._trim_history() # Trim if needed *after* adding
+            self._trim_history()
             if not self.save():
-                 # Log critical failure, but maybe don't stop the bot?
-                 # Or potentially raise an exception if saving state is absolutely critical
                  log.critical(f"CRITICAL: Failed to save state after adding processed ID {tweet_id}!")
-        else:
-            log.debug(f"Tweet ID {tweet_id} is already in processed history.")
+        # else:
+            # log.debug(f"Tweet ID {tweet_id} is already in processed history.") # Less verbose
 
     def increment_daily_count(self):
         """Increments the daily correction count. Saves state."""
-        if self.last_reset_date != date.today():
-            log.warning("Attempted to increment daily count, but date has changed. Resetting count first.")
+        today = date.today()
+        if self.last_reset_date != today:
+            log.warning("Date changed during increment. Resetting count first.")
             self.corrections_today_count = 0
-            self.last_reset_date = date.today()
+            self.last_reset_date = today
 
         self.corrections_today_count += 1
         log.info(f"Daily correction count incremented to {self.corrections_today_count}/{self.config.daily_correction_limit}")
@@ -305,11 +312,11 @@ class BotState:
 
     def is_limit_reached(self) -> bool:
         """Checks if the daily correction limit has been reached for today."""
-        # Also reset if date changed
-        if self.last_reset_date != date.today():
-             log.info(f"Date changed during limit check ({self.last_reset_date} -> {date.today()}). Resetting count.")
+        today = date.today()
+        if self.last_reset_date != today:
+             log.info(f"Date changed during limit check ({self.last_reset_date} -> {today}). Resetting count.")
              self.corrections_today_count = 0
-             self.last_reset_date = date.today()
+             self.last_reset_date = today
              if not self.save():
                   log.error("Failed to save state after date change check.")
              return False # Limit not reached for the new day
@@ -321,7 +328,7 @@ class BotState:
 # --- Tweepy Client Initialization ---
 missing_creds = config.validate_credentials()
 if missing_creds:
-    log.critical(f"Twitter API credentials missing! Check .env file for: {', '.join(missing_creds)}. Exiting.")
+    log.critical(f"Missing Twitter API credentials in .env: {', '.join(missing_creds)}. Exiting.")
     exit(1)
 
 tweepy_client = None
@@ -340,20 +347,21 @@ except tweepy.errors.TweepyException as e:
     log.critical(f"Failed to initialize Tweepy client: {e}", exc_info=config.debug_mode)
     exit(1)
 except Exception as e:
-    log.critical(f"Unexpected error during Tweepy client initialization: {e}", exc_info=config.debug_mode)
+    log.critical(f"Unexpected error initializing Tweepy client: {e}", exc_info=config.debug_mode)
     exit(1)
 # --- End Tweepy Client Initialization ---
 
 
 # --- Helper Functions ---
-def extract_number(text):
+def extract_number(text: Optional[str]) -> int:
     """Extracts a number (possibly with K/M suffix) from text."""
     if not text: return 0
     text = text.replace(",", "").strip()
-    match = re.search(r"([\d.]+)([KM]?)", text, re.IGNORECASE)
+    match = re.search(r"([\d,.]+)([KM]?)", text, re.IGNORECASE)
     if not match: return 0
     try:
-        num = float(match.group(1))
+        num_str = match.group(1).replace(',', '')
+        num = float(num_str)
         suffix = match.group(2).upper() if match.group(2) else ""
         if suffix == "K": return int(num * 1000)
         if suffix == "M": return int(num * 1000000)
@@ -361,105 +369,158 @@ def extract_number(text):
     except ValueError:
         return 0
 
-def parse_tweet_timestamp(timestamp_str):
+def parse_tweet_timestamp(timestamp_str: Optional[str]) -> Optional[datetime]:
     """Parses Nitter's timestamp format into a timezone-aware datetime object."""
+    if not timestamp_str: return None
     try:
-        # Example: "May 10, 2024 · 10:30 AM UTC"
         timestamp_str = re.sub(r'\s+', ' ', timestamp_str).strip()
         parts = timestamp_str.split('·')
         if len(parts) != 2: raise ValueError("Timestamp format incorrect: Missing '·' separator")
-        date_part = parts[0].strip()
-        time_part_full = parts[1].strip() # e.g., "10:30 AM UTC"
 
-        # More robust time parsing
+        date_part = parts[0].strip()
+        time_part_full = parts[1].strip()
+
         time_match = re.match(r"(\d{1,2}:\d{2}\s+(?:AM|PM))(?:\s+(.*))?", time_part_full, re.IGNORECASE)
         if not time_match: raise ValueError("Timestamp format incorrect: Could not parse time")
 
         time_value_str = time_match.group(1)
-        timezone_str = (time_match.group(2) or "UTC").upper() # Default to UTC if missing
+        timezone_str = (time_match.group(2) or "UTC").upper()
 
-        dt_str = f"{date_part} {time_value_str}" # e.g., "May 10, 2024 10:30 AM"
-        tweet_time_naive = datetime.strptime(dt_str, "%b %d, %Y %I:%M %p") # Use %b for month abbr
+        dt_str = f"{date_part} {time_value_str}"
+        try:
+            tweet_time_naive = datetime.strptime(dt_str, "%b %d, %Y %I:%M %p")
+        except ValueError:
+            tweet_time_naive = datetime.strptime(dt_str, "%d %b %Y %I:%M %p")
 
-        if timezone_str == "UTC":
-            return tweet_time_naive.replace(tzinfo=timezone.utc)
-        else:
-            # Attempt to handle offset like "+0300" if needed in the future
-            log.warning(f"Non-UTC timezone '{timezone_str}' detected: '{timestamp_str}'. Assuming UTC.")
-            return tweet_time_naive.replace(tzinfo=timezone.utc)
+        if timezone_str != "UTC":
+             log.warning(f"Non-UTC timezone '{timezone_str}' detected: '{timestamp_str}'. Assuming UTC.")
+
+        return tweet_time_naive.replace(tzinfo=timezone.utc)
 
     except (ValueError, TypeError, IndexError) as e:
         log.debug(f"Could not parse timestamp '{timestamp_str}'. Error: {e}")
         return None
+
+def chunk_list(data: list, size: int) -> list:
+    """Yields successive chunks of a list."""
+    if size <= 0:
+        yield data
+        return
+    for i in range(0, len(data), size):
+        yield data[i:i + size]
+
 # --- End Helper Functions ---
 
 
 # --- Core Function 1: Scraper ---
-async def _extract_tweet_data_async(item, error_pairs, connected_instance_url):
-    """Extracts structured data from a single Nitter tweet HTML element."""
+async def _extract_tweet_data_async(item, error_pairs_in_chunk: List[Tuple[str, str]], connected_instance_url: str) -> Optional[Dict]:
+    """Extracts structured data from a single Nitter tweet HTML element, matching errors from the specific chunk."""
+    tweet_link_element = None # Define outside try for logging context
+    tweet_id = "unknown"
     try:
+        # Query essential elements first
         tweet_link_element = await item.query_selector("a.tweet-link")
-        username_element = await item.query_selector("a.username")
-        timestamp_element = await item.query_selector("span.tweet-date a")
+        if not tweet_link_element: return None
         tweet_text_element = await item.query_selector("div.tweet-content")
+        if not tweet_text_element: return None
 
-        if not all([tweet_link_element, username_element, timestamp_element, tweet_text_element]):
-            log.debug("Skipping item: Missing essential elements.")
-            return None
-
-        tweet_link_raw = await tweet_link_element.get_attribute("href")
-        tweet_link = urllib.parse.urljoin(connected_instance_url, tweet_link_raw) if tweet_link_raw else None
-        tweet_id_match = re.search(r"/(?:status|statuses)/(\d+)", tweet_link) if tweet_link else None
-        tweet_id = tweet_id_match.group(1) if tweet_id_match else None
-        if not tweet_id:
-            log.debug(f"Skipping item: Could not extract tweet ID from link '{tweet_link}'.")
-            return None
-
-        username = (await username_element.inner_text()).strip().lstrip('@') # Remove leading @
-        timestamp_str = (await timestamp_element.get_attribute("title") or await timestamp_element.inner_text()).strip()
         tweet_text = (await tweet_text_element.inner_text()).strip()
-
-        # Basic Filtering
-        if tweet_text.startswith("RT @"):
-            log.debug(f"Skipping tweet {tweet_id}: Retweet.")
+        if tweet_text.startswith("RT @") or not tweet_text:
             return None
-        # Add other filters? e.g., minimum length?
 
-        # Find first matching error
+        # Check for errors from the current chunk
         found_error = next(
             (
                 {"incorrect": incorrect, "correct": correct}
-                for incorrect, correct in error_pairs
+                for incorrect, correct in error_pairs_in_chunk
                 if re.search(r"\b" + re.escape(incorrect) + r"\b", tweet_text, re.IGNORECASE | re.UNICODE)
             ),
             None,
         )
-        if not found_error: return None # Skip if no error found in this tweet
+        if not found_error:
+            return None
 
-        # Extract Engagement Stats
+        # Extract remaining data only if an error was found
+        tweet_link_raw = await tweet_link_element.get_attribute("href")
+        tweet_link = urllib.parse.urljoin(connected_instance_url, tweet_link_raw) if tweet_link_raw else None
+        tweet_id_match = re.search(r"/(?:status|statuses)/(\d+)", tweet_link or "")
+        if tweet_id_match:
+            tweet_id = tweet_id_match.group(1)
+
+        username_element = await item.query_selector("a.username")
+        timestamp_element = await item.query_selector("span.tweet-date a")
+        if not username_element or not timestamp_element:
+             log.debug(f"[{tweet_id}] Skipping item: Missing username or timestamp.")
+             return None
+
+        username = (await username_element.inner_text()).strip().lstrip('@')
+        timestamp_str = (await timestamp_element.get_attribute("title") or await timestamp_element.inner_text()).strip()
+        parsed_timestamp = parse_tweet_timestamp(timestamp_str)
+        if not parsed_timestamp:
+             log.debug(f"Skipping tweet {tweet_id}: Invalid timestamp '{timestamp_str}'.")
+             return None
+
+        # --- CORRECTED Engagement Stats Extraction (using old working logic) ---
         replies, retweets, likes, quotes = 0, 0, 0, 0
+        # Only log this line once if debugging the start of extraction
+        # log.debug(f"[{tweet_id}] Attempting to extract stats using corrected logic...")
         stats_elements = await item.query_selector_all("div.tweet-stats .tweet-stat")
+        if not stats_elements and config.debug_mode: # Log only in debug if no stats found
+            log.debug(f"[{tweet_id}] No '.tweet-stat' elements found.")
+
         for stat_element in stats_elements:
+            stat_text = ""
+            stat_value = 0
+            icon_class = ""
+            assigned_to = "none"
             try:
                 icon_container = await stat_element.query_selector("div.icon-container")
                 if icon_container:
                     stat_text = await icon_container.inner_text()
                     stat_value = extract_number(stat_text)
-                    icon = await icon_container.query_selector("span[class^='icon-']")
+
+                    icon = await icon_container.query_selector("span[class^='icon-'], i[class^='icon-']")
                     if icon:
                         icon_class = await icon.get_attribute("class") or ""
-                        # Check class names for different Nitter themes/versions
-                        if any(k in icon_class for k in ["comment", "reply"]): replies = stat_value
-                        elif "retweet" in icon_class: retweets = stat_value
-                        elif any(k in icon_class for k in ["heart", "like", "favorite"]): likes = stat_value
-                        elif "quote" in icon_class: quotes = stat_value
-            except Exception as e:
-                log.debug(f"Minor error extracting stat for {tweet_id}: {e}")
+                        # Assign based on icon class
+                        if any(k in icon_class for k in ["comment", "reply", "bubble"]):
+                            replies = stat_value
+                            assigned_to = "replies"
+                        elif any(k in icon_class for k in ["retweet", "recycle"]):
+                            retweets = stat_value
+                            assigned_to = "retweets"
+                        elif any(k in icon_class for k in ["heart", "like", "favorite"]):
+                            likes = stat_value
+                            assigned_to = "likes"
+                        elif "quote" in icon_class:
+                            quotes = stat_value
+                            assigned_to = "quotes"
+                        elif config.debug_mode and stat_value > 0: # Log only if debug and value > 0
+                            log.debug(f"[{tweet_id}] Stat value {stat_value} extracted but icon class '{icon_class}' not matched.")
 
-        parsed_timestamp = parse_tweet_timestamp(timestamp_str)
-        if not parsed_timestamp:
-             log.debug(f"Skipping tweet {tweet_id}: Invalid timestamp '{timestamp_str}'.")
-             return None
+                        if config.debug_mode: # Log details only in debug mode
+                             log.debug(f"[{tweet_id}] Stat Raw Text='{stat_text}', Extracted Value={stat_value}, Icon Class='{icon_class}', Assigned: {assigned_to} = {stat_value}")
+
+                    elif config.debug_mode: # Log only if debug
+                        # Fallback attempt (less reliable) if icon missing but container exists
+                        log.debug(f"[{tweet_id}] Icon container found, but no specific icon element found within. Text was: '{stat_text}'")
+                        text_lower = stat_text.lower()
+                        if ("comment" in text_lower or "repl" in text_lower) and replies == 0: replies = stat_value
+                        elif "retweet" in text_lower and retweets == 0: retweets = stat_value
+                        elif ("like" in text_lower or "heart" in text_lower or "favorite" in text_lower) and likes == 0: likes = stat_value
+                        elif "quote" in text_lower and quotes == 0: quotes = stat_value
+                elif config.debug_mode: # Log only if debug
+                     log.debug(f"[{tweet_id}] No 'div.icon-container' found for a stat element.")
+
+            except Exception as e:
+                 # Log only in debug mode
+                if config.debug_mode:
+                    log.debug(f"Minor error extracting individual stat for tweet {tweet_id}: {e}", exc_info=False)
+        # --- END CORRECTED Engagement Stats Extraction ---
+
+        # Log final results only if debugging
+        if config.debug_mode:
+            log.debug(f"[{tweet_id}] Final engagement extracted: R:{replies}, RT:{retweets}, L:{likes}, Q:{quotes}")
 
         return {
             "username": username, "timestamp_str": timestamp_str, "parsed_timestamp": parsed_timestamp,
@@ -468,335 +529,379 @@ async def _extract_tweet_data_async(item, error_pairs, connected_instance_url):
             "engagement": {"replies": replies, "retweets": retweets, "likes": likes, "quotes": quotes},
         }
     except Exception as e:
-        log.warning(f"Error processing a tweet element: {e}", exc_info=config.debug_mode)
+        current_tweet_id = tweet_id if 'tweet_id' in locals() and tweet_id != "unknown" else 'unknown'
+        log.warning(f"Error processing tweet element for ID {current_tweet_id}: {e}", exc_info=config.debug_mode)
+        if tweet_link_element:
+             try:
+                  faulty_link = await tweet_link_element.get_attribute('href')
+                  log.warning(f"Faulty element link (approx): {faulty_link}")
+             except: pass
         return None
 
-async def scrape_tweets(config: Config):
-    """Scrapes Nitter for tweets containing specified errors."""
-    log.info("Starting tweet scraping process...")
-    incorrect_words_query = " OR ".join([f'"{pair[0]}"' for pair in config.error_pairs])
-    base_query = f"({incorrect_words_query}) {config.min_engagement_query} lang:ar -filter:retweets -filter:replies"
-    encoded_query = urllib.parse.quote(base_query)
-    search_url_template = "/search?f=tweets&q={query}&since=&until=&near="
-    log.info(f"Constructed base query: {base_query}")
+async def scrape_tweets(config: Config) -> List[Dict]:
+    """Scrapes Nitter using chunked queries for tweets containing specified errors."""
+    log.info(f"Starting chunked tweet scraping process (Chunk Size: {config.search_chunk_size})...")
 
-    fetched_tweets = []
-    processed_tweet_ids_this_scrape = set() # Avoid duplicates within a single scrape run
-    connected_instance = None
+    all_fetched_tweets: List[Dict] = []
+    processed_tweet_ids_this_scrape: Set[str] = set()
+
+    error_pair_chunks = list(chunk_list(config.error_pairs, config.search_chunk_size))
+    total_chunks = len(error_pair_chunks)
+    log.info(f"Divided {len(config.error_pairs)} error pairs into {total_chunks} chunks.")
 
     async with async_playwright() as p:
-        browser = None # Define browser outside try block for potential closing in finally
+        browser = None
+        context = None
         try:
-            browser = await p.firefox.launch(headless=True) # Consider making headless configurable
+            browser = await p.firefox.launch(headless=True)
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36", # Slightly updated UA
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36", # Keep UA reasonably updated
                 java_script_enabled=True,
+                viewport={'width': 1920, 'height': 1080} # Set a common viewport
             )
-            # Anti-bot detection measures
             await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            page = await context.new_page()
 
-            # Try Nitter instances sequentially
-            for instance in config.nitter_instances:
-                search_url = instance + search_url_template.format(query=encoded_query)
-                log.info(f"Trying Nitter instance: {instance}")
+            for i, chunk in enumerate(error_pair_chunks):
+                if not chunk: continue
+                chunk_num = i + 1
+                log.info(f"--- Processing Chunk {chunk_num}/{total_chunks} ---")
+
+                incorrect_words_query = " OR ".join([f'"{pair[0]}"' for pair in chunk])
+                base_query = f"({incorrect_words_query}) {config.min_engagement_query} lang:ar -filter:retweets -filter:replies"
+                encoded_query = urllib.parse.quote(base_query)
+                search_url_template = "/search?f=tweets&q={query}&since=&until=&near="
+                if config.debug_mode: log.debug(f"Chunk {chunk_num} Query: {base_query}")
+
+                connected_instance = None
+                page = None
+
                 try:
-                    await page.goto(search_url, timeout=30000, wait_until="domcontentloaded") # 30s timeout
-                    # Wait for either timeline items or an error message
-                    await page.wait_for_selector("div.timeline .timeline-item, div.timeline span.error-panel", timeout=20000) # 20s wait
+                    page = await context.new_page()
+                    for instance in config.nitter_instances:
+                        search_url = instance + search_url_template.format(query=encoded_query)
+                        log.info(f"Chunk {chunk_num}: Trying instance {instance}")
+                        try:
+                            await page.goto(search_url, timeout=45000, wait_until="domcontentloaded")
+                            await page.wait_for_selector("div.timeline .timeline-item, div.error-panel, div.timeline div:text('No results found')", timeout=30000)
 
-                    # Check for explicit "no results" or error panels
-                    no_results = await page.query_selector("div.timeline span.error-panel, div.timeline div:text('No results found')") # More specific check
-                    if no_results:
-                        error_text = await no_results.inner_text()
-                        log.warning(f"Instance {instance} returned no results/error: {error_text.strip()}")
-                        await asyncio.sleep(0.5) # Small delay before trying next
-                        continue # Try next instance
+                            no_results_or_error = await page.query_selector("div.error-panel, div.timeline div:text('No results found')")
+                            if no_results_or_error:
+                                error_text = await no_results_or_error.inner_text()
+                                log.warning(f"Chunk {chunk_num}: Instance {instance} reported: {error_text.strip()}")
+                                await asyncio.sleep(0.5)
+                                continue
 
-                    # Check if timeline items actually loaded
-                    if not await page.query_selector("div.timeline .timeline-item"):
-                         log.warning(f"Instance {instance} loaded but no timeline items found.")
-                         await asyncio.sleep(0.5)
-                         continue
+                            if not await page.query_selector("div.timeline .timeline-item"):
+                                log.warning(f"Chunk {chunk_num}: Instance {instance} loaded but no timeline items found (unexpected).")
+                                await asyncio.sleep(0.5)
+                                continue
 
-                    connected_instance = instance
-                    log.info(f"Successfully connected to {instance}.")
-                    break # Exit loop on successful connection
-                except Exception as e:
-                    # Catch specific Playwright errors if needed (TimeoutError, etc.)
-                    log.warning(f"Failed to load or timed out on {instance}: {e}")
-                    await asyncio.sleep(1) # Longer delay on failure
+                            connected_instance = instance
+                            log.info(f"Chunk {chunk_num}: Successfully connected to {instance}.")
+                            break
 
-            if not connected_instance:
-                log.error("Could not retrieve results from any Nitter instance.")
-                return [] # Return empty list
+                        except Exception as e:
+                            log.warning(f"Chunk {chunk_num}: Failed/timed out on {instance}: {type(e).__name__}") # Less verbose error
+                            if config.debug_mode: log.debug(f"Instance {instance} failure details: {e}") # Details only in debug
+                            await asyncio.sleep(random.uniform(0.5, 1.5))
 
-            # Give JS a moment to potentially load more content (optional)
-            await page.wait_for_timeout(2000)
+                    if not connected_instance:
+                        log.error(f"Chunk {chunk_num}: Could not retrieve results from any Nitter instance.")
+                        continue
 
-            # Select only direct timeline items, excluding 'show more' links etc.
-            tweet_elements = await page.query_selector_all("div.timeline > .timeline-item:not(.show-more)")
-            log.info(f"Found {len(tweet_elements)} potential tweet elements on {connected_instance}.")
+                    await page.wait_for_timeout(random.randint(1500, 3000))
+                    await page.evaluate('window.scrollBy(0, document.body.scrollHeight / 4)') # Scroll down a bit
+                    await page.wait_for_timeout(random.randint(500, 1500))
 
-            tasks = [_extract_tweet_data_async(item, config.error_pairs, connected_instance) for item in tweet_elements]
-            results = await asyncio.gather(*tasks)
+                    tweet_elements = await page.query_selector_all("div.timeline > div.timeline-item:not(.show-more)")
+                    log.info(f"Chunk {chunk_num}: Found {len(tweet_elements)} potential elements on {connected_instance}.")
 
-            # Filter out None results and duplicates from this scrape
-            for tweet_data in results:
-                if tweet_data and tweet_data["tweet_id"] not in processed_tweet_ids_this_scrape:
-                    if len(fetched_tweets) < config.scrape_max_tweets:
-                        fetched_tweets.append(tweet_data)
-                        processed_tweet_ids_this_scrape.add(tweet_data["tweet_id"])
-                        log.debug(f"Added candidate tweet {tweet_data['tweet_id']} from @{tweet_data['username']}")
-                    else:
-                        log.info(f"Reached scrape limit ({config.scrape_max_tweets}).")
-                        break # Stop collecting more tweets
+                    tasks = [_extract_tweet_data_async(item, chunk, connected_instance) for item in tweet_elements]
+                    results = await asyncio.gather(*tasks)
+
+                    chunk_added_count = 0
+                    for tweet_data in results:
+                        if tweet_data and tweet_data["tweet_id"] not in processed_tweet_ids_this_scrape:
+                            if len(all_fetched_tweets) < config.scrape_max_tweets_per_cycle:
+                                all_fetched_tweets.append(tweet_data)
+                                processed_tweet_ids_this_scrape.add(tweet_data["tweet_id"])
+                                chunk_added_count += 1
+                            else:
+                                log.info(f"Reached scrape cycle limit ({config.scrape_max_tweets_per_cycle}) during chunk {chunk_num}.")
+                                break
+
+                    log.info(f"Chunk {chunk_num}: Added {chunk_added_count} new unique candidates.")
+                    if len(all_fetched_tweets) >= config.scrape_max_tweets_per_cycle:
+                         log.info(f"Total scrape limit reached after chunk {chunk_num}. Stopping scrape.")
+                         break
+
+                except Exception as chunk_e:
+                    log.error(f"Error during processing of chunk {chunk_num}: {chunk_e}", exc_info=config.debug_mode)
+                finally:
+                    if page:
+                        try: await page.close()
+                        except Exception: pass # Ignore errors closing page
 
         except Exception as e:
-            log.error(f"Error during Playwright scraping process: {e}", exc_info=config.debug_mode)
-            return [] # Return empty on major scraping error
+            log.error(f"Major error during Playwright setup or execution: {e}", exc_info=config.debug_mode)
         finally:
             if browser:
-                await browser.close()
+                try: await browser.close()
+                except Exception: pass # Ignore errors closing browser
 
-    log.info(f"Scraping finished. Found {len(fetched_tweets)} unique candidates matching criteria.")
-    return fetched_tweets
+    log.info(f"Scraping finished. Found {len(all_fetched_tweets)} total unique candidates across all chunks.")
+    return all_fetched_tweets
 # --- End Core Function 1 ---
 
 
 # --- Core Function 2: Process and Correct ---
-def _post_correction_reply_internal(tweet_id, correction_message, tweepy_client):
+def _post_correction_reply_internal(tweet_id: str, correction_message: str, tweepy_client: tweepy.Client) -> Tuple[bool, str]:
     """Internal function to post the reply using Tweepy."""
     if not (tweet_id and correction_message and tweepy_client):
         log.error("Cannot post reply: tweet_id, message, or client missing.")
         return False, "internal_error"
     try:
-        log.debug(f"Attempting to reply to tweet {tweet_id}")
-        # Use V2 method
+        log.debug(f"Attempting Tweepy v2 reply to tweet {tweet_id}")
         response = tweepy_client.create_tweet(text=correction_message, in_reply_to_tweet_id=tweet_id)
 
         if response and response.data and "id" in response.data:
-            log.info(f"Successfully replied to {tweet_id}. New tweet ID: {response.data['id']}")
-            return True, None # Success
+            log.info(f"Successfully replied to {tweet_id}. Reply tweet ID: {response.data['id']}")
+            return True, "success"
         else:
-            # Log the raw response if debugging is needed
-            log.error(f"Failed to reply to {tweet_id}. Unexpected API response format: {response}")
+            log.error(f"Failed reply to {tweet_id}. Unexpected API response: {response}")
             return False, "api_error"
 
     except tweepy.errors.Forbidden as e:
-        # Check specific error codes/messages if available in e.response or e.api_codes/messages
         error_str = str(e).lower()
-        # Add more specific forbidden reasons if encountered
-        forbidden_phrases = [
-            "you are not allowed to", "cannot reply to protected", "user suspended",
-            "unable to perform this action", "not allowed to create a tweet with duplicate content",
-            "cannot send replies to users who are not following you", # Less common with V2 replies?
-            "403 forbidden" # Generic fallback
-        ]
-        if any(phrase in error_str for phrase in forbidden_phrases) or (e.response and e.response.status_code == 403):
-             log.warning(f"Reply forbidden/duplicate for {tweet_id} (403): {e}")
-             return False, "tweet_specific_error" # Treat as skippable for this tweet
+        if "duplicate content" in error_str:
+             log.warning(f"Reply forbidden for {tweet_id} (403 - Duplicate): {e}")
+             return False, "tweet_specific_error_duplicate"
+        elif any(phrase in error_str for phrase in ["not allowed to", "cannot reply", "user suspended", "protected", "cannot perform this action"]):
+             log.warning(f"Reply forbidden for {tweet_id} (403 - Restriction): {e}")
+             return False, "tweet_specific_error_restriction"
         else:
              log.error(f"Unhandled Forbidden error (403) replying to {tweet_id}: {e}", exc_info=config.debug_mode)
-             return False, "api_error" # Treat as potentially systemic API issue
+             return False, "api_error"
 
     except tweepy.errors.NotFound as e:
-        log.warning(f"Failed to reply to {tweet_id} (Tweet Not Found - 404): {e}")
-        return False, "tweet_specific_error" # Tweet deleted or ID incorrect
+        log.warning(f"Failed reply to {tweet_id} (Tweet Not Found - 404): {e}")
+        return False, "tweet_specific_error_deleted"
 
     except tweepy.errors.TweepyException as e:
-        # Handle other potential Tweepy/Twitter API errors (e.g., rate limits - though client handles waits)
-        log.error(f"Failed to reply (TweepyException) to {tweet_id}: {e}", exc_info=config.debug_mode)
-        # Could check for specific error codes here if needed
-        return False, "api_error" # Assume potential API issue
+        log.error(f"TweepyException replying to {tweet_id}: {e}", exc_info=config.debug_mode)
+        return False, "api_error"
 
     except Exception as e:
-        log.error(f"Unexpected error replying to {tweet_id}: {e}", exc_info=True)
-        return False, "internal_error" # Bot's internal code error
+        log.error(f"Unexpected internal error replying to {tweet_id}: {e}", exc_info=True)
+        return False, "internal_error"
 
-
-def _is_valid_candidate(tweet_data, bot_state: BotState, config: Config) -> bool:
+def _is_valid_candidate(tweet_data: Dict, bot_state: BotState, config: Config) -> bool:
     """Checks if a scraped tweet is a valid candidate for correction."""
     tweet_id = tweet_data.get("tweet_id")
     parsed_timestamp = tweet_data.get("parsed_timestamp")
     error_info = tweet_data.get("error_found")
 
-    # Basic data integrity checks
-    if not all([tweet_id, parsed_timestamp, error_info]): return False
-    if not isinstance(parsed_timestamp, datetime): return False # Must be datetime obj
-    if not isinstance(error_info, dict): return False
+    if not all([tweet_id, parsed_timestamp, error_info]):
+        log.debug(f"Skipping candidate: Missing essential data.")
+        return False
+    if not isinstance(parsed_timestamp, datetime):
+        log.debug(f"Skipping {tweet_id}: Invalid timestamp type.")
+        return False
+    if not isinstance(error_info, dict) or "incorrect" not in error_info or "correct" not in error_info:
+         log.debug(f"Skipping {tweet_id}: Invalid error_info.")
+         return False
 
-    # Check 1: Already processed recently? (Using BotState)
     if bot_state.has_processed(tweet_id):
-        log.debug(f"Skipping {tweet_id}: Found in recently processed history.")
         return False
 
-    # Check 2: Too old?
-    if (datetime.now(timezone.utc) - parsed_timestamp).days > config.max_tweet_age_days:
-        log.debug(f"Skipping {tweet_id}: Too old ({parsed_timestamp.date()}, limit {config.max_tweet_age_days} days).")
+    now_utc = datetime.now(timezone.utc)
+    if (now_utc - parsed_timestamp).days > config.max_tweet_age_days:
+        log.debug(f"Skipping {tweet_id}: Too old ({parsed_timestamp.date()}).")
         return False
 
-    # Check 3: Check against bot's own username? (Prevent self-correction loops)
-    # bot_username = os.getenv(f"BOT_USERNAME_{config.bot_id}") # Requires adding bot username to env
-    # if bot_username and tweet_data.get("username", "").lower() == bot_username.lower():
-    #     log.debug(f"Skipping {tweet_id}: Own tweet by {bot_username}.")
-    #     return False
+    return True
 
-    # Add any other filtering rules here if needed
-
-    return True # Passed all checks
-
-def process_and_correct_tweet(candidate_tweets, bot_state: BotState, tweepy_client, config: Config):
+def _calculate_score(tweet_data: Dict, config: Config, now_utc: datetime) -> float:
     """
-    Filters candidates, selects the best one, attempts correction, and updates state.
+    Calculates an engagement score, factoring in tweet age for prioritization.
+    Uses exponential decay: score = raw_engagement * exp(-k * age_in_hours).
+    """
+    engagement = tweet_data.get("engagement", {})
+    likes = engagement.get("likes", 0)
+    retweets = engagement.get("retweets", 0)
+    quotes = engagement.get("quotes", 0)
+    parsed_timestamp = tweet_data.get("parsed_timestamp")
+    tweet_id = tweet_data.get("tweet_id", "N/A") # For logging context
+
+    raw_score = float(likes + (retweets * 1.5) + (quotes * 0.5))
+
+    decay_factor = 1.0
+    if isinstance(parsed_timestamp, datetime):
+        try:
+            tweet_age = now_utc - parsed_timestamp
+            tweet_age_hours = max(0.0, tweet_age.total_seconds() / 3600.0)
+
+            # Retrieve k from the config object
+            decay_k = config.score_age_decay_k
+            decay_factor = math.exp(-decay_k * tweet_age_hours)
+
+            if config.debug_mode:
+                 log.debug(f"[{tweet_id}] Raw Score: {raw_score:.2f}, Age (hrs): {tweet_age_hours:.2f}, Decay Factor (k={decay_k}): {decay_factor:.4f}")
+
+        except AttributeError:
+            # This handles the case where score_age_decay_k might be missing during development/testing
+            log.error(f"[{tweet_id}] Config object missing 'score_age_decay_k' attribute! Using decay=0.1", exc_info=False)
+            decay_factor = 0.1
+        except Exception as e:
+            log.warning(f"Error calculating age decay for tweet {tweet_id}: {e}", exc_info=False)
+            decay_factor = 0.1 # Penalize if age calculation fails
+    else:
+         log.warning(f"Missing or invalid timestamp for tweet {tweet_id}. Using decay factor 1.0.")
+
+    final_score = raw_score * decay_factor
+    if config.debug_mode:
+         log.debug(f"[{tweet_id}] Final Score: {final_score:.2f}")
+    return final_score
+
+def process_and_correct_tweet(candidate_tweets: List[Dict], bot_state: BotState, tweepy_client: tweepy.Client, config: Config) -> Optional[str]:
+    """
+    Filters candidates, scores them, selects the best, attempts correction, and updates state.
     Returns the ID of the corrected tweet if successful, otherwise None.
     """
     if not candidate_tweets:
         log.info("No candidates provided for processing.")
         return None
 
-    # Filter candidates based on validity checks (age, processed history)
+    # 1. Filter candidates
     valid_candidates = [
         t for t in candidate_tweets
         if _is_valid_candidate(t, bot_state, config)
     ]
-    log.info(f"Processing {len(valid_candidates)} valid candidates (after filtering).")
+    log.info(f"Processing {len(valid_candidates)} valid candidates (after filtering {len(candidate_tweets)} scraped).")
 
     if not valid_candidates:
         log.info("No valid, unprocessed candidates found this cycle.")
         return None
 
-    # Prioritize the most recent valid candidate
-    valid_candidates.sort(key=lambda t: t["parsed_timestamp"], reverse=True)
-    log.debug(f"Top candidate chosen: {valid_candidates[0]['tweet_id']} from @{valid_candidates[0]['username']} ({valid_candidates[0]['timestamp_str']})")
+    # 2. Score and Sort valid candidates
+    now_utc = datetime.now(timezone.utc)
+    for candidate in valid_candidates:
+        candidate['score'] = _calculate_score(candidate, config, now_utc)
 
+    valid_candidates.sort(key=lambda t: t.get('score', 0.0), reverse=True)
+
+    # Check if score_age_decay_k exists before logging it
+    decay_k_log = f"k={config.score_age_decay_k}" if hasattr(config, 'score_age_decay_k') else "k=N/A"
+    log.info(f"Top candidates by time-weighted score ({decay_k_log}):")
+    for i, c in enumerate(valid_candidates[:5]):
+        log.info(f"  {i+1}. ID: {c['tweet_id']}, Score: {c['score']:.2f}, User: @{c['username']}, Error: '{c['error_found']['incorrect']}'")
+        if config.debug_mode: # Log raw engagement only in debug
+            log.info(f"     Raw Engagement: R:{c['engagement']['replies']}, RT:{c['engagement']['retweets']}, L:{c['engagement']['likes']}, Q:{c['engagement']['quotes']}")
+
+    # 3. Attempt correction on the highest-scoring valid candidates
     corrected_tweet_id = None
-    # Loop through sorted candidates (try newest first)
     for candidate in valid_candidates:
         tweet_id = candidate["tweet_id"]
         incorrect = candidate["error_found"]["incorrect"]
         correct = candidate["error_found"]["correct"]
         username = candidate["username"]
+        score = candidate["score"]
 
-        log.info(f"Attempting correction for tweet {tweet_id} by @{username}: '{incorrect}' -> '{correct}'")
+        log.info(f"Attempting correction for high-priority tweet {tweet_id} (Score: {score:.2f}) by @{username}: '{incorrect}' -> '{correct}'")
 
-        # --- Step 1: Mark as processed BEFORE API call ---
-        # This ensures we don't retry it immediately if the script crashes during the API call
-        # The BotState class handles saving internally.
         bot_state.add_processed(tweet_id)
 
-        # --- Step 2: Construct the reply message ---
-        # Consider adding context or being gentler? Optional.
-        correction_message = f"❌ {incorrect}\n✅ {correct}"
-        log.debug(f"Correction message prepared for {tweet_id}: \"{correction_message.replace(chr(10), ' ')}\"")
+        correction_message = f"@{username}\n\nتصحيح:\n❌ {incorrect}\n✅ {correct}"
+        if config.debug_mode: log.debug(f"Correction message for {tweet_id}: \"{correction_message.replace(chr(10), ' / ')}\"")
 
-        # --- Step 3: Attempt to post the reply ---
         success, error_type = _post_correction_reply_internal(tweet_id, correction_message, tweepy_client)
 
-        # --- Step 4: Update state based on outcome ---
         if success:
             log.info(f"Correction successful for {tweet_id}.")
-            bot_state.increment_daily_count() # Handles saving state internally
+            bot_state.increment_daily_count()
             corrected_tweet_id = tweet_id
-            break # Exit loop on first successful correction
+            break
 
-        elif error_type == "tweet_specific_error":
-            # Logged in _post_correction_reply_internal
-            log.warning(f"Skipping {tweet_id} due to tweet-specific issue ({error_type}). Trying next candidate if available.")
-            # No state change needed here, already marked as processed
-            continue # Try the next valid candidate
+        elif error_type.startswith("tweet_specific_error"):
+            log.warning(f"Skipping {tweet_id} due to tweet-specific issue ({error_type}). Trying next.")
+            continue
 
         elif error_type in ["api_error", "internal_error"]:
-            # Logged in _post_correction_reply_internal
-            log.error(f"Stopping correction attempts this cycle due to non-tweet-specific error ({error_type}) while processing {tweet_id}.")
-            # No state change needed here, already marked as processed
-            corrected_tweet_id = None # Ensure we don't report success
-            break # Stop trying other candidates in this cycle due to systemic issue
+            log.error(f"Stopping correction attempts this cycle due to non-tweet-specific error ({error_type}) on tweet {tweet_id}.")
+            corrected_tweet_id = None
+            break
         else:
-             # Should not happen if error types are handled
-             log.error(f"Unknown error type '{error_type}' returned processing {tweet_id}. Stopping cycle.")
+             log.error(f"Unknown error type '{error_type}' from reply function for {tweet_id}. Stopping cycle.")
              corrected_tweet_id = None
              break
 
-    # --- Cycle Summary ---
     if corrected_tweet_id:
-        log.info(f"Correction cycle finished successfully. Corrected Tweet ID: {corrected_tweet_id}")
-    else:
-        if valid_candidates: # Only log this if there were candidates to try
-             log.info("Correction cycle finished. No suitable candidate was successfully corrected this cycle.")
-        # If no valid_candidates, message logged earlier.
+        log.info(f"Correction cycle finished. Successfully corrected tweet ID: {corrected_tweet_id}")
+    elif valid_candidates:
+         log.info("Correction cycle finished. No candidate was successfully corrected this cycle.")
 
-    return corrected_tweet_id # Return the ID if successful, None otherwise
+    return corrected_tweet_id
 # --- End Core Function 2 ---
 
 
 # --- Core Function 3: Main Loop Logic ---
-def run_bot_cycle(bot_state: BotState, tweepy_client, config: Config):
-    """Runs a single cycle of the bot: check limit, scrape, process."""
+def run_bot_cycle(bot_state: BotState, tweepy_client: tweepy.Client, config: Config):
+    """Runs a single cycle of the bot: check limit, scrape (chunked), process (scored)."""
     start_time_mono = time.monotonic()
     current_time_utc = datetime.now(timezone.utc)
 
     log.info(f"--- Cycle Start ({current_time_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}) ---")
     log.info(f"Daily Count: {bot_state.corrections_today_count}/{config.daily_correction_limit}. History Size: {len(bot_state._processed_ids_set)}.")
 
-    corrected_this_cycle = False
     if not bot_state.is_limit_reached():
-        log.info("Daily limit not reached. Proceeding with scrape and process.")
+        log.info("Daily limit OK. Proceeding with scrape and process.")
 
-        # 1. Scrape for potential candidates
-        # We run asyncio scraper in the main thread context here
-        fetched_tweets = asyncio.run(scrape_tweets(config))
+        try:
+            fetched_tweets = asyncio.run(scrape_tweets(config))
+        except Exception as scrape_err:
+            log.error(f"Error occurred during scrape_tweets execution: {scrape_err}", exc_info=config.debug_mode)
+            fetched_tweets = []
 
-        # 2. Process candidates and attempt correction
         if fetched_tweets:
-            corrected_id = process_and_correct_tweet(fetched_tweets, bot_state, tweepy_client, config)
-            if corrected_id:
-                corrected_this_cycle = True
-                # Daily count and processed state are updated within process_and_correct_tweet
+            process_and_correct_tweet(fetched_tweets, bot_state, tweepy_client, config)
         else:
-            log.info("Scraper returned no candidates.")
+            log.info("Scraper returned no candidates this cycle.")
 
     else:
         log.info(f"Daily correction limit ({config.daily_correction_limit}) reached for {bot_state.last_reset_date}. Skipping scrape/process.")
 
-    # Calculate time until next cycle
+    # --- Calculate Sleep Duration ---
     cycle_duration = time.monotonic() - start_time_mono
     log.info(f"Cycle took {cycle_duration:.2f}s.")
 
+    sleep_duration_s: float
+    now_utc = datetime.now(timezone.utc) # Recalculate current time
+
     if bot_state.is_limit_reached():
-        # Sleep until after midnight UTC
         try:
-            today_date_obj = date.today() # Use current date
+            today_date_obj = now_utc.date()
             next_day_start_utc = datetime.combine(today_date_obj + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
-            # Add a small buffer past midnight (e.g., 1-5 minutes)
-            sleep_buffer = random.randint(60, 300)
-            seconds_until_next_run = (next_day_start_utc - current_time_utc).total_seconds() + sleep_buffer
+            sleep_buffer_s = random.uniform(60, 300)
+            seconds_until_next_run = (next_day_start_utc - now_utc).total_seconds() + sleep_buffer_s
             sleep_duration_s = max(config.min_sleep_between_cycles_s, seconds_until_next_run)
-            log.info(f"Limit reached. Sleeping until after midnight UTC (~{sleep_duration_s / 3600:.2f}h).")
+            log.info(f"Limit reached. Sleeping until after midnight UTC (~{(sleep_duration_s / 3600):.2f}h).")
         except Exception as e:
-            log.error(f"Error calculating sleep until midnight: {e}. Sleeping for 1 hour as fallback.", exc_info=config.debug_mode)
-            sleep_duration_s = 3600
+            log.error(f"Error calculating sleep until midnight: {e}. Sleeping for 1 hour fallback.", exc_info=config.debug_mode)
+            sleep_duration_s = 3600.0
     else:
-        # Calculate interval based on remaining limit (avoid division by zero)
-        remaining_limit = config.daily_correction_limit - bot_state.corrections_today_count
-        seconds_in_day = 24 * 60 * 60
-        time_until_midnight = (datetime.combine(date.today() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc) - current_time_utc).total_seconds()
+        remaining_limit = max(1, config.daily_correction_limit - bot_state.corrections_today_count)
+        today_date_obj = now_utc.date()
+        next_day_start_utc = datetime.combine(today_date_obj + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+        time_until_midnight_s = max(1.0, (next_day_start_utc - now_utc).total_seconds())
 
-        if remaining_limit > 0 and time_until_midnight > 0:
-             base_interval_s = max(1.0, time_until_midnight / remaining_limit) # At least 1 second interval
-             log.debug(f"Target interval based on remaining {remaining_limit} corrections over {time_until_midnight/3600:.1f}h: ~{base_interval_s / 60:.1f} min")
-        else:
-             # Fallback if no limit left or past midnight already
-             base_interval_s = seconds_in_day / config.daily_correction_limit if config.daily_correction_limit > 0 else seconds_in_day
-             log.debug(f"Using default base interval: ~{base_interval_s / 60:.1f} min")
+        base_interval_s = time_until_midnight_s / remaining_limit
+        log.debug(f"Target interval: ~{base_interval_s / 60:.1f} min ({remaining_limit} left over {time_until_midnight_s / 3600:.1f}h)")
 
-        # Add jitter
         jitter = random.uniform(-config.max_interval_jitter_s, config.max_interval_jitter_s)
         calculated_sleep = base_interval_s + jitter
 
-        # Ensure minimum sleep and prevent negative sleep
         sleep_duration_s = max(config.min_sleep_between_cycles_s, calculated_sleep)
-        log.info(f"Calculated sleep duration: {sleep_duration_s:.0f}s (Base: {base_interval_s:.0f}s, Jitter: {jitter:.0f}s)")
+        log.info(f"Calculated sleep: {sleep_duration_s:.0f}s (Base: {base_interval_s:.0f}s, Jitter: {jitter:.0f}s)")
 
     log.info(f"--- Sleeping for {sleep_duration_s:.0f} seconds ---")
     time.sleep(sleep_duration_s)
@@ -806,13 +911,17 @@ def run_bot_cycle(bot_state: BotState, tweepy_client, config: Config):
 
 # --- Script Entry Point ---
 if __name__ == "__main__":
-    log.info(f"================ Starting Bot Worker: {config.bot_id} ================")
+    log.info(f"================ Starting Bot Worker: {config.bot_id.upper()} ================")
     log.info(f"Daily Limit: {config.daily_correction_limit}, Min Engagement: {config.min_engagement_query}")
+    log.info(f"Max Tweet Age: {config.max_tweet_age_days} days, Search Chunk Size: {config.search_chunk_size}")
+    # Check attribute exists before logging
+    decay_k_info = f"{config.score_age_decay_k}" if hasattr(config, 'score_age_decay_k') else "N/A (Check Config)"
+    log.info(f"Score Age Decay K: {decay_k_info}")
     log.info(f"Debug Mode: {config.debug_mode}, Max History Size: {config.max_processed_history_size}")
     log.info(f"State File: {config.state_filename}")
+    log.info(f"Loaded {len(config.error_pairs)} error pairs for mode '{config.bot_id.lower()}'.")
     log.info("===========================================================")
 
-    # Initialize state management (will load existing or create new)
     try:
         bot_state = BotState(config)
     except Exception as e:
@@ -828,6 +937,8 @@ if __name__ == "__main__":
     except Exception as e:
         # Catch unexpected errors in the main loop itself
         log.critical(f"An uncaught exception occurred in the main loop: {e}", exc_info=True)
+        # Add a small delay before exiting to allow logs to flush?
+        time.sleep(2)
     finally:
-        log.info(f"Bot worker process [{config.bot_id}] terminated.")
+        log.info(f"Bot worker process [{config.bot_id.upper()}] terminated.")
 # --- End Script Entry Point ---
