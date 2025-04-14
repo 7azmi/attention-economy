@@ -81,7 +81,7 @@ class Config:
         self.daily_correction_limit = int(os.getenv(f"DAILY_LIMIT_{self.bot_id}", 15))
         self.min_engagement_query = os.getenv(f"MIN_ENGAGEMENT_{self.bot_id}", "(min_retweets:50 OR min_faves:100)")
         self.max_tweet_age_days = int(os.getenv("MAX_TWEET_AGE_DAYS", 2))
-        self.scrape_max_tweets_per_cycle = int(os.getenv("SCRAPE_MAX_TWEETS_PER_CYCLE", 50))
+        self.scrape_max_tweets_per_cycle = int(os.getenv("SCRAPE_MAX_TWEETS_PER_CYCLE", 300))
         self.scraper_timeout_ms = int(os.getenv("SCRAPER_TIMEOUT_S", 120)) * 1000 # Playwright uses ms
         self.max_interval_jitter_s = int(os.getenv("MAX_INTERVAL_JITTER_S", 300))
         self.min_sleep_between_cycles_s = int(os.getenv("MIN_SLEEP_BETWEEN_CYCLES_S", 60))
